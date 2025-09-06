@@ -1,0 +1,19 @@
+# Face Enhancement Service Dependencies
+# Base dependencies cần thiết cho face enhancement
+opencv-python==4.9.0.80
+onnxruntime-gpu==1.21.0
+runpod>=1.6.0
+minio>=7.0.0
+requests>=2.31.0
+tqdm>=4.65.0
+numpy==1.24.3
+
+# InsightFace dependencies
+scikit-image
+Pillow
+matplotlib
+scipy
+easydict
+cython
+protobuf
+onnx
