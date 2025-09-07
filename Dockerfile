@@ -83,7 +83,7 @@ RUN echo "=== Downloading face detection model ===" && \
 # Download face recognition model
 RUN echo "=== Downloading face recognition model ===" && \
     wget --no-check-certificate --timeout=60 --tries=3 \
-    "http://108.181.198.160:9000/aiclipdfl/recognition.onnx" \
+    "https://huggingface.co/manh-linh/faceID_recognition/resolve/main/recognition.onnx" \
     -O /app/models/face_detection/recognition.onnx && \
     echo "✅ Face recognition model downloaded"
 
