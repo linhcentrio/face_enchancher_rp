@@ -68,47 +68,93 @@ MODEL_PATHS = {
     "face_recognition": "/app/models/face_detection/recognition.onnx"
 }
 
+def create_optimized_session_options():
+    """Create optimized ONNX Runtime session options"""
+    session_options = onnxruntime.SessionOptions()
+    session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+    session_options.enable_cpu_mem_arena = False
+    session_options.enable_mem_pattern = False
+    return session_options
+
+def get_optimized_providers():
+    """Get optimized ONNX Runtime providers"""
+    if torch.cuda.is_available():
+        cuda_provider_options = {
+            'device_id': 0,
+            'arena_extend_strategy': 'kNextPowerOfTwo',
+            'gpu_mem_limit': 8 * 1024 * 1024 * 1024,  # 8GB limit
+            'cudnn_conv_algo_search': 'EXHAUSTIVE',
+            'do_copy_in_default_stream': True,
+        }
+        providers = [
+            ('CUDAExecutionProvider', cuda_provider_options),
+            'CPUExecutionProvider'
+        ]
+        logger.info("🚀 Using optimized CUDA providers")
+    else:
+        providers = ['CPUExecutionProvider']
+        logger.info("⚠️ CUDA not available, using CPU")
+    
+    return providers
+
 def initialize_models():
-    """Initialize face enhancement models"""
+    """Initialize face enhancement models with optimized ONNX Runtime settings"""
     global detector, enhancer, recognition
     
     try:
-        # Initialize face detector
+        # Create optimized session options
+        session_options = create_optimized_session_options()
+        providers = get_optimized_providers()
+        
+        # Initialize face detector với optimized settings
         detector_path = MODEL_PATHS["face_detector"]
         if not os.path.exists(detector_path):
             raise FileNotFoundError(f"Face detector model not found: {detector_path}")
             
         detector = RetinaFace(
             detector_path,
-            provider=[
-                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}),
-                "CPUExecutionProvider"
-            ],
-            session_options=None
+            provider=providers,
+            session_options=session_options
         )
-        logger.info("✅ Face detector initialized")
+        logger.info("✅ Face detector initialized with optimized settings")
         
-        # Initialize face recognition
+        # Initialize face recognition với optimized settings
         recognition_path = MODEL_PATHS["face_recognition"]
         if not os.path.exists(recognition_path):
             raise FileNotFoundError(f"Face recognition model not found: {recognition_path}")
             
-        recognition = FaceRecognition(recognition_path)
-        logger.info("✅ Face recognition initialized")
+        # Create optimized recognition session
+        recognition_session = onnxruntime.InferenceSession(
+            recognition_path,
+            sess_options=session_options,
+            providers=providers
+        )
+        recognition = FaceRecognition(session=recognition_session)
+        logger.info("✅ Face recognition initialized with optimized settings")
         
-        # Initialize face enhancer
+        # Initialize face enhancer với optimized settings
         enhancer_path = MODEL_PATHS["face_enhancer"]
         if not os.path.exists(enhancer_path):
             raise FileNotFoundError(f"Face enhancer model not found: {enhancer_path}")
         
         # Determine device for GFPGAN
-        device = 'cpu'
-        if torch.cuda.is_available():
-            device = 'cuda'
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         logger.info(f"Running on {device}")
         
-        enhancer = GFPGAN(model_path=enhancer_path, device=device)
-        logger.info(f"✅ Face enhancer initialized on {device}")
+        enhancer = GFPGAN(
+            model_path=enhancer_path, 
+            device=device,
+            session_options=session_options,
+            providers=providers
+        )
+        logger.info(f"✅ Face enhancer initialized on {device} with optimized settings")
+        
+        # Log providers info
+        logger.info(f"🔧 Available ONNX providers: {onnxruntime.get_available_providers()}")
+        if torch.cuda.is_available():
+            logger.info(f"🎮 GPU: {torch.cuda.get_device_name()}")
+            logger.info(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
     except Exception as e:
         logger.error(f"❌ Model initialization failed: {e}")
@@ -213,17 +259,23 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
         
         logger.info(f"Processing {total_frames} frames with face enhancement...")
         
+        detection_times = []
+        enhancement_times = []
+        
         for frame_idx in tqdm(range(total_frames), desc="Enhancing faces"):
             ret, frame = video_stream.read()
             if not ret:
                 break
             
-            # Try to detect faces
+            # Try to detect faces với timing
+            face_detection_start = time.time()
             try:
                 bboxes, kpss = detector.detect(frame, input_size=(320, 320), det_thresh=0.3)
+                detection_times.append(time.time() - face_detection_start)
             except Exception as e:
                 logger.debug(f"Face detection failed for frame {frame_idx}: {e}")
                 bboxes, kpss = [], []
+                detection_times.append(time.time() - face_detection_start)
             
             if len(kpss) == 0:
                 # No face → Keep original frame
@@ -239,15 +291,30 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
                 frame_buffer.append((frame, aligned_face, mat))
                 
                 if len(frame_buffer) >= batch_size:
+                    enhancement_start = time.time()
                     process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
+                    enhancement_times.append(time.time() - enhancement_start)
                     stats["faces_enhanced"] += len(frame_buffer)
                     frame_buffer = []
+                    
+                    # Log performance every 10 batches
+                    if len(enhancement_times) % 10 == 0:
+                        avg_detection = np.mean(detection_times[-40:]) if detection_times else 0
+                        avg_enhancement = np.mean(enhancement_times[-10:]) if enhancement_times else 0
+                        logger.info(f"🔄 Batch {len(enhancement_times)}: Detection={avg_detection:.3f}s, Enhancement={avg_enhancement:.3f}s")
+                        
             except Exception as e:
                 logger.debug(f"Face processing failed for frame {frame_idx}: {e}")
                 # If face processing fails, keep original frame
                 out.write(frame)
                 stats["frames_with_faces"] -= 1
                 stats["frames_without_faces"] += 1
+        
+        # Log final performance stats
+        if detection_times:
+            logger.info(f"📊 Average face detection time: {np.mean(detection_times):.3f}s")
+        if enhancement_times:
+            logger.info(f"📊 Average enhancement batch time: {np.mean(enhancement_times):.3f}s")
         
         # Process remaining frames
         if frame_buffer:

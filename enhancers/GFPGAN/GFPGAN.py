@@ -3,12 +3,28 @@ import onnxruntime
 import numpy as np
 
 class GFPGAN:
-    def __init__(self, model_path="GFPGANv1.4.onnx", device='cpu'):
-        session_options = onnxruntime.SessionOptions()
-        session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        providers = ["CPUExecutionProvider"]
-        if device == 'cuda':
-            providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}), "CPUExecutionProvider"]
+    def __init__(self, model_path="GFPGANv1.4.onnx", device='cpu', session_options=None, providers=None):
+        # Use provided session options or create default ones
+        if session_options is None:
+            session_options = onnxruntime.SessionOptions()
+            session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+            session_options.enable_cpu_mem_arena = False
+            session_options.enable_mem_pattern = False
+        
+        # Use provided providers or create default ones
+        if providers is None:
+            providers = ["CPUExecutionProvider"]
+            if device == 'cuda':
+                cuda_provider_options = {
+                    'device_id': 0,
+                    'arena_extend_strategy': 'kNextPowerOfTwo',
+                    'gpu_mem_limit': 6 * 1024 * 1024 * 1024,  # 6GB for GFPGAN
+                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                    'do_copy_in_default_stream': True,
+                }
+                providers = [("CUDAExecutionProvider", cuda_provider_options), "CPUExecutionProvider"]
+        
         self.session = onnxruntime.InferenceSession(model_path, sess_options=session_options, providers=providers)
         self.resolution = self.session.get_inputs()[0].shape[-2:]
 

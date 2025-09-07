@@ -224,8 +224,37 @@ class FaceRecognition:
         if self.session is None:
             assert onnx_path is not None
             assert os.path.exists(onnx_path)
-            self.session = InferenceSession(onnx_path,
-                                            providers=['CUDAExecutionProvider'])
+            
+            # Create optimized providers for face recognition
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    cuda_provider_options = {
+                        'device_id': 0,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB for face recognition
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'do_copy_in_default_stream': True,
+                    }
+                    providers = [('CUDAExecutionProvider', cuda_provider_options), 'CPUExecutionProvider']
+                else:
+                    providers = ['CPUExecutionProvider']
+            except:
+                providers = ['CPUExecutionProvider']
+            
+            # Create optimized session options
+            from onnxruntime import SessionOptions, GraphOptimizationLevel, ExecutionMode
+            session_options = SessionOptions()
+            session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+            session_options.execution_mode = ExecutionMode.ORT_PARALLEL
+            session_options.enable_cpu_mem_arena = False
+            session_options.enable_mem_pattern = False
+            
+            self.session = InferenceSession(
+                onnx_path,
+                sess_options=session_options,
+                providers=providers
+            )
 
     def __call__(self, x):
         x = x.astype('float32')
