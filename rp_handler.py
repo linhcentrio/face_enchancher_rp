@@ -69,34 +69,116 @@ MODEL_PATHS = {
 }
 
 def create_optimized_session_options():
-    """Create optimized ONNX Runtime session options"""
+    """Create optimized ONNX Runtime session options for GPU"""
     session_options = onnxruntime.SessionOptions()
-    session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
-    session_options.enable_cpu_mem_arena = False
-    session_options.enable_mem_pattern = False
+    
+    # Optimize for GPU if available
+    if 'CUDAExecutionProvider' in onnxruntime.get_available_providers():
+        # GPU optimizations
+        session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL  # Better for GPU
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+        session_options.add_session_config_entry('session.disable_prepacking', '1')  # Better GPU memory
+        session_options.add_session_config_entry('session.use_env_allocators', '1')
+        logger.info("🚀 Configured session options for GPU execution")
+    else:
+        # CPU optimizations
+        session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+        session_options.enable_cpu_mem_arena = True
+        session_options.enable_mem_pattern = True
+        session_options.intra_op_num_threads = 0  # Use all available CPU cores
+        session_options.inter_op_num_threads = 0
+        logger.info("🔄 Configured session options for CPU execution")
+    
     return session_options
 
 def get_optimized_providers():
-    """Get optimized ONNX Runtime providers"""
-    if torch.cuda.is_available():
+    """Get optimized ONNX Runtime providers with comprehensive GPU checking"""
+    available_providers = onnxruntime.get_available_providers()
+    logger.info(f"🔍 Available ONNX providers: {available_providers}")
+    
+    # Check if CUDA is available in both PyTorch and ONNX Runtime
+    torch_cuda = torch.cuda.is_available()
+    onnx_cuda = 'CUDAExecutionProvider' in available_providers
+    
+    logger.info(f"🎮 PyTorch CUDA available: {torch_cuda}")
+    logger.info(f"🔧 ONNX CUDA provider available: {onnx_cuda}")
+    
+    if torch_cuda and onnx_cuda:
+        # More conservative CUDA settings to avoid fallback
         cuda_provider_options = {
             'device_id': 0,
-            'arena_extend_strategy': 'kNextPowerOfTwo',
-            'gpu_mem_limit': 8 * 1024 * 1024 * 1024,  # 8GB limit
-            'cudnn_conv_algo_search': 'EXHAUSTIVE',
+            'arena_extend_strategy': 'kSameAsRequested',  # More conservative
+            'gpu_mem_limit': 6 * 1024 * 1024 * 1024,     # 6GB limit (more conservative)
+            'cudnn_conv_algo_search': 'HEURISTIC',        # Faster than EXHAUSTIVE
             'do_copy_in_default_stream': True,
+            'enable_cuda_graph': False,                   # Disable for stability
         }
         providers = [
             ('CUDAExecutionProvider', cuda_provider_options),
             'CPUExecutionProvider'
         ]
         logger.info("🚀 Using optimized CUDA providers")
+        
+        # Verify GPU info
+        if torch_cuda:
+            logger.info(f"🎮 GPU: {torch.cuda.get_device_name()}")
+            logger.info(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
+            logger.info(f"🔋 GPU Memory Free: {torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated():.0f} bytes")
     else:
         providers = ['CPUExecutionProvider']
-        logger.info("⚠️ CUDA not available, using CPU")
+        if not torch_cuda:
+            logger.warning("⚠️ PyTorch CUDA not available")
+        if not onnx_cuda:
+            logger.warning("⚠️ ONNX CUDA provider not available. Install onnxruntime-gpu")
+        logger.info("🔄 Falling back to CPU execution")
     
     return providers
+
+def validate_gpu_usage(enhancer):
+    """Validate that GPU is actually being used by running a test inference"""
+    try:
+        if torch.cuda.is_available() and 'CUDAExecutionProvider' in onnxruntime.get_available_providers():
+            logger.info("🧪 Testing GPU inference...")
+            
+            # Create a small test image
+            test_img = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+            
+            # Clear GPU memory and measure before
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                mem_before = torch.cuda.memory_allocated()
+            
+            # Run test inference
+            start_time = time.time()
+            enhanced = enhancer.enhance(test_img)
+            inference_time = time.time() - start_time
+            
+            # Check GPU memory usage after
+            if torch.cuda.is_available():
+                mem_after = torch.cuda.memory_allocated()
+                mem_used = (mem_after - mem_before) / 1024 / 1024  # MB
+                
+                if mem_used > 0:
+                    logger.info(f"✅ GPU inference confirmed! Time: {inference_time:.3f}s, GPU Memory used: {mem_used:.1f}MB")
+                else:
+                    logger.warning(f"⚠️ GPU memory not increased. Possible CPU fallback. Time: {inference_time:.3f}s")
+            else:
+                logger.info(f"🔄 CPU inference completed in {inference_time:.3f}s")
+                
+            # Verify output shape
+            if enhanced.shape == test_img.shape:
+                logger.info(f"✅ Test inference successful - Output shape matches input: {enhanced.shape}")
+            else:
+                logger.error(f"❌ Test inference failed - Shape mismatch: {enhanced.shape} vs {test_img.shape}")
+                
+        else:
+            logger.info("🔄 Skipping GPU validation - CUDA not available")
+            
+    except Exception as e:
+        logger.error(f"❌ GPU validation failed: {e}")
 
 def initialize_models():
     """Initialize face enhancement models with optimized ONNX Runtime settings"""
@@ -150,6 +232,9 @@ def initialize_models():
         )
         logger.info(f"✅ Face enhancer initialized on {device} with optimized settings")
         
+        # Validate that GPU is actually being used
+        validate_gpu_usage(enhancer)
+        
         # Log providers info
         logger.info(f"🔧 Available ONNX providers: {onnxruntime.get_available_providers()}")
         if torch.cuda.is_available():
@@ -200,6 +285,19 @@ def upload_to_minio(local_path: str, object_name: str) -> str:
 
 def process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height):
     """Process batch of frames with face enhancement"""
+    if not frame_buffer:
+        return
+    
+    # Validate batch size to prevent memory issues
+    if len(frame_buffer) > 10:
+        logger.warning(f"⚠️ Large batch size detected: {len(frame_buffer)}. Processing in smaller chunks.")
+        # Process in smaller chunks
+        chunk_size = 5
+        for i in range(0, len(frame_buffer), chunk_size):
+            chunk = frame_buffer[i:i+chunk_size]
+            process_batch(chunk, enhancer, face_mask, out, frame_width, frame_height)
+        return
+    
     frames, aligned_faces, mats = zip(*frame_buffer)
     enhanced_faces = enhancer.enhance_batch(aligned_faces)
     
@@ -254,7 +352,7 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
         face_mask = cv2.cvtColor(face_mask, cv2.COLOR_GRAY2RGB)
         face_mask = face_mask / 255
         
-        batch_size = 4  # Increased batch size for better performance
+        batch_size = 2  # Reduced batch size to prevent memory issues
         frame_buffer = []
         
         logger.info(f"Processing {total_frames} frames with face enhancement...")
@@ -292,10 +390,18 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
                 
                 if len(frame_buffer) >= batch_size:
                     enhancement_start = time.time()
-                    process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
-                    enhancement_times.append(time.time() - enhancement_start)
-                    stats["faces_enhanced"] += len(frame_buffer)
-                    frame_buffer = []
+                    try:
+                        process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
+                        enhancement_times.append(time.time() - enhancement_start)
+                        stats["faces_enhanced"] += len(frame_buffer)
+                    except Exception as e:
+                        logger.error(f"❌ Batch processing failed: {e}")
+                        # Fallback: process frames individually without enhancement
+                        for frame, _, _ in frame_buffer:
+                            out.write(frame)
+                        stats["frames_without_faces"] += len(frame_buffer)
+                    finally:
+                        frame_buffer = []
                     
                     # Log performance every 10 batches
                     if len(enhancement_times) % 10 == 0:
@@ -318,8 +424,15 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
         
         # Process remaining frames
         if frame_buffer:
-            process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
-            stats["faces_enhanced"] += len(frame_buffer)
+            try:
+                process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
+                stats["faces_enhanced"] += len(frame_buffer)
+            except Exception as e:
+                logger.error(f"❌ Final batch processing failed: {e}")
+                # Fallback: process frames individually without enhancement
+                for frame, _, _ in frame_buffer:
+                    out.write(frame)
+                stats["frames_without_faces"] += len(frame_buffer)
         
         video_stream.release()
         out.release()
