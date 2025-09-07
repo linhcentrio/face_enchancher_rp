@@ -283,35 +283,6 @@ def upload_to_minio(local_path: str, object_name: str) -> str:
         logger.error(f"❌ Upload failed: {e}")
         raise e
 
-def process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height):
-    """Process batch of frames with face enhancement"""
-    if not frame_buffer:
-        return
-    
-    # Validate batch size to prevent memory issues
-    if len(frame_buffer) > 10:
-        logger.warning(f"⚠️ Large batch size detected: {len(frame_buffer)}. Processing in smaller chunks.")
-        # Process in smaller chunks
-        chunk_size = 5
-        for i in range(0, len(frame_buffer), chunk_size):
-            chunk = frame_buffer[i:i+chunk_size]
-            process_batch(chunk, enhancer, face_mask, out, frame_width, frame_height)
-        return
-    
-    frames, aligned_faces, mats = zip(*frame_buffer)
-    enhanced_faces = enhancer.enhance_batch(aligned_faces)
-    
-    for frame, aligned_face, mat, enhanced_face in zip(frames, aligned_faces, mats, enhanced_faces):
-        enhanced_face_resized = cv2.resize(enhanced_face, (aligned_face.shape[1], aligned_face.shape[0]))
-        face_mask_resized = cv2.resize(face_mask, (enhanced_face_resized.shape[1], enhanced_face_resized.shape[0]))
-        blended_face = (face_mask_resized * enhanced_face_resized + (1 - face_mask_resized) * aligned_face).astype(np.uint8)
-        
-        mat_rev = cv2.invertAffineTransform(mat)
-        dealigned_face = cv2.warpAffine(blended_face, mat_rev, (frame_width, frame_height))
-        mask = cv2.warpAffine(face_mask_resized, mat_rev, (frame_width, frame_height))
-        final_frame = (mask * dealigned_face + (1 - mask) * frame).astype(np.uint8)
-        
-        out.write(final_frame)
 
 def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) -> tuple[bool, dict]:
     """Apply face enhancement to video using GFPGAN"""
@@ -352,10 +323,7 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
         face_mask = cv2.cvtColor(face_mask, cv2.COLOR_GRAY2RGB)
         face_mask = face_mask / 255
         
-        batch_size = 2  # Reduced batch size to prevent memory issues
-        frame_buffer = []
-        
-        logger.info(f"Processing {total_frames} frames with face enhancement...")
+        logger.info(f"Processing {total_frames} frames with face enhancement (frame-by-frame)...")
         
         detection_times = []
         enhancement_times = []
@@ -386,28 +354,39 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
             
             try:
                 aligned_face, mat = get_cropped_head_256(frame, kpss[0], size=256, scale=1.0)
-                frame_buffer.append((frame, aligned_face, mat))
                 
-                if len(frame_buffer) >= batch_size:
-                    enhancement_start = time.time()
-                    try:
-                        process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
-                        enhancement_times.append(time.time() - enhancement_start)
-                        stats["faces_enhanced"] += len(frame_buffer)
-                    except Exception as e:
-                        logger.error(f"❌ Batch processing failed: {e}")
-                        # Fallback: process frames individually without enhancement
-                        for frame, _, _ in frame_buffer:
-                            out.write(frame)
-                        stats["frames_without_faces"] += len(frame_buffer)
-                    finally:
-                        frame_buffer = []
+                # Process frame immediately - no batching to avoid dimension issues
+                enhancement_start = time.time()
+                try:
+                    # Process single face immediately
+                    enhanced_face = enhancer.enhance(aligned_face)  # Use single image method
                     
-                    # Log performance every 10 batches
-                    if len(enhancement_times) % 10 == 0:
-                        avg_detection = np.mean(detection_times[-40:]) if detection_times else 0
-                        avg_enhancement = np.mean(enhancement_times[-10:]) if enhancement_times else 0
-                        logger.info(f"🔄 Batch {len(enhancement_times)}: Detection={avg_detection:.3f}s, Enhancement={avg_enhancement:.3f}s")
+                    # Blend enhanced face back into frame
+                    enhanced_face_resized = cv2.resize(enhanced_face, (aligned_face.shape[1], aligned_face.shape[0]))
+                    face_mask_resized = cv2.resize(face_mask, (enhanced_face_resized.shape[1], enhanced_face_resized.shape[0]))
+                    blended_face = (face_mask_resized * enhanced_face_resized + (1 - face_mask_resized) * aligned_face).astype(np.uint8)
+                    
+                    mat_rev = cv2.invertAffineTransform(mat)
+                    dealigned_face = cv2.warpAffine(blended_face, mat_rev, (frame_width, frame_height))
+                    mask = cv2.warpAffine(face_mask_resized, mat_rev, (frame_width, frame_height))
+                    final_frame = (mask * dealigned_face + (1 - mask) * frame).astype(np.uint8)
+                    
+                    out.write(final_frame)
+                    enhancement_times.append(time.time() - enhancement_start)
+                    stats["faces_enhanced"] += 1
+                    
+                except Exception as e:
+                    logger.debug(f"❌ Face enhancement failed for frame {frame_idx}: {e}")
+                    # Fallback: use original frame
+                    out.write(frame)
+                    stats["frames_without_faces"] += 1
+                    stats["frames_with_faces"] -= 1
+                
+                # Log performance every 50 frames
+                if len(enhancement_times) % 50 == 0:
+                    avg_detection = np.mean(detection_times[-100:]) if detection_times else 0
+                    avg_enhancement = np.mean(enhancement_times[-50:]) if enhancement_times else 0
+                    logger.info(f"🔄 Frame {frame_idx}: Detection={avg_detection:.3f}s, Enhancement={avg_enhancement:.3f}s per frame")
                         
             except Exception as e:
                 logger.debug(f"Face processing failed for frame {frame_idx}: {e}")
@@ -418,21 +397,10 @@ def enhance_video_with_gfpgan(input_video_path: str, output_path: str = None) ->
         
         # Log final performance stats
         if detection_times:
-            logger.info(f"📊 Average face detection time: {np.mean(detection_times):.3f}s")
+            logger.info(f"📊 Average face detection time: {np.mean(detection_times):.3f}s per frame")
         if enhancement_times:
-            logger.info(f"📊 Average enhancement batch time: {np.mean(enhancement_times):.3f}s")
-        
-        # Process remaining frames
-        if frame_buffer:
-            try:
-                process_batch(frame_buffer, enhancer, face_mask, out, frame_width, frame_height)
-                stats["faces_enhanced"] += len(frame_buffer)
-            except Exception as e:
-                logger.error(f"❌ Final batch processing failed: {e}")
-                # Fallback: process frames individually without enhancement
-                for frame, _, _ in frame_buffer:
-                    out.write(frame)
-                stats["frames_without_faces"] += len(frame_buffer)
+            logger.info(f"📊 Average enhancement time: {np.mean(enhancement_times):.3f}s per frame")
+            logger.info(f"📊 Total frames enhanced: {len(enhancement_times)}")
         
         video_stream.release()
         out.release()
